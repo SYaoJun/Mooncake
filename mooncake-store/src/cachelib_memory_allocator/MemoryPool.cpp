@@ -39,8 +39,7 @@ MemoryPool::MemoryPool(PoolId id,
 
 void MemoryPool::checkState() const {
   if (id_ < 0) {
-    throw std::invalid_argument(
-        fmt::format("Invalid MemoryPool id {}", id_));
+    throw std::invalid_argument(fmt::format("Invalid MemoryPool id {}", id_));
   }
 
   const size_t currAlloc = currAllocSize_;
@@ -48,8 +47,8 @@ void MemoryPool::checkState() const {
   if (currAlloc > currSlabAlloc) {
     throw std::invalid_argument(
         fmt::format("Alloc size {} is more than total slab alloc size {}",
-                       currAlloc,
-                       currSlabAlloc));
+                    currAlloc,
+                    currSlabAlloc));
   }
 
   if (acSizes_.empty() || ac_.empty()) {
@@ -86,7 +85,8 @@ void MemoryPool::checkState() const {
 
   for (const auto slab : freeSlabs_) {
     if (!slabAllocator_.isValidSlab(slab)) {
-      throw std::invalid_argument(fmt::format("Invalid free slab {}", (void*) slab));
+      throw std::invalid_argument(
+          fmt::format("Invalid free slab {}", (void*)slab));
     }
   }
 }
@@ -175,7 +175,7 @@ ClassId MemoryPool::getAllocationClassId(const void* memory) const {
   const auto classId = header->classId;
   if (classId >= static_cast<ClassId>(ac_.size()) || classId < 0) {
     // at this point, the slab indicates that it belongs to a bogus classId and
-    // things are corrupt and the caller cant do anything about it. so throw an
+    // things are corrupt and the caller can't do anything about it. so throw an
     // exception to abort.
     throw std::runtime_error(fmt::format(
         "corrupt slab header/memory pool with class id {}", classId));
@@ -193,7 +193,7 @@ Slab* MemoryPool::getSlabLocked() noexcept {
 
     // increment the size under lock to serialize. This ensures that only one
     // thread can possibly go above the limit and fetch it from free list or
-    // the slab allocator. If we dont get it from the free list or slab
+    // the slab allocator. If we don't get it from the free list or slab
     // allocator, we bump it down.
     currSlabAllocSize_ += Slab::kSize;
 
