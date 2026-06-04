@@ -15,6 +15,9 @@
 #include "ha/standby_controller.h"
 #include "rpc_service.h"
 
+// Forward declaration of the global shutdown flag defined in master.cpp.
+extern std::atomic<bool> g_shutdown_requested;
+
 namespace mooncake {
 namespace ha {
 
@@ -205,7 +208,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
     EnterStandbyMode(admin_server, *standby_controller,
                      accept_standby_runtime_updates, std::nullopt);
 
-    while (true) {
+    while (!g_shutdown_requested.load(std::memory_order_acquire)) {
         auto coordinator = CreateLeaderCoordinator(spec);
         if (!coordinator) {
             if (HandleSupervisorError("create leader coordinator",
@@ -218,7 +221,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto& leader_coordinator = *coordinator.value();
         std::optional<LeadershipSession> leadership_session;
 
-        while (!leadership_session.has_value()) {
+        while (!leadership_session.has_value() &&
+               !g_shutdown_requested.load(std::memory_order_acquire)) {
             SetRuntimeState(admin_server, MasterRuntimeState::kCandidate);
 
             auto current_view = leader_coordinator.ReadCurrentView();
@@ -428,6 +432,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             ActivateServingState(admin_server, wrapped_master_service);
         }
 
+        // If the global shutdown flag was raised during async_start, stop
+        // the server now so the get() below won't block indefinitely.
+        if (g_shutdown_requested.load(std::memory_order_acquire)) {
+            server.stop();
+        }
+
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
@@ -446,6 +456,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
     }
 
+    LOG(INFO) << "Master supervisor shutting down gracefully.";
     return 0;
 }
 

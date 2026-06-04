@@ -1,6 +1,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <atomic>
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <memory>  // For std::unique_ptr
@@ -32,6 +33,17 @@ static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
 
 constexpr char kDefaultKvLeaseTtlFlagValue[] = "5000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
+
+// Global atomic flag used to signal a graceful shutdown from SIGINT/SIGTERM.
+// External linkage so that the HA supervisor (master_service_supervisor.cpp)
+// can also read it.
+std::atomic<bool> g_shutdown_requested{false};
+
+// Signal handler that sets the global shutdown flag.
+// Re-entrant-safe: only writes to an atomic.
+static void ShutdownSignalHandler(int /*signum*/) {
+    g_shutdown_requested.store(true, std::memory_order_release);
+}
 
 namespace {
 
@@ -1077,6 +1089,21 @@ int main(int argc, char* argv[]) {
         << ", cxl_path=" << master_config.cxl_path
         << ", cxl_size=" << master_config.cxl_size;
 
+    // Register signal handlers for graceful shutdown on SIGINT / SIGTERM.
+    // Use sigaction to ensure SA_RESTART is not set, so blocking calls
+    // (e.g. server.start()) are interrupted on signal delivery.
+    {
+        struct sigaction sa;
+        sa.sa_handler = ShutdownSignalHandler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;  // No SA_RESTART – blocking syscalls will be
+                           // interrupted.
+        sigaction(SIGINT, &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+        // Ignore SIGPIPE so the process doesn't die on broken connections.
+        signal(SIGPIPE, SIG_IGN);
+    }
+
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
     if (master_config.enable_http_metadata_server) {
@@ -1096,7 +1123,42 @@ int main(int argc, char* argv[]) {
     if (master_config.enable_ha) {
         mooncake::ha::MasterServiceSupervisor supervisor(
             mooncake::MasterServiceSupervisorConfig{master_config});
-        return supervisor.Start();
+
+        // Launch the supervisor on a dedicated thread so the main thread can
+        // wait for a shutdown signal and then request a graceful stop.
+        std::atomic<int> supervisor_ret{-1};
+        std::thread supervisor_thread([&]() {
+            supervisor_ret.store(supervisor.Start(), std::memory_order_release);
+        });
+
+        // Wait until either the supervisor finishes on its own or a shutdown
+        // signal is received.
+        while (!g_shutdown_requested.load(std::memory_order_acquire)) {
+            // Check if the supervisor thread has already exited.
+            if (supervisor_ret.load(std::memory_order_acquire) != -1) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (g_shutdown_requested.load(std::memory_order_acquire)) {
+            LOG(INFO) << "Master received shutdown signal, stopping...";
+            // The HA supervisor's RunSupervisorLoop runs an infinite while(true)
+            // and does not currently expose a public Stop() method.  In
+            // practice the supervisor thread will be joined when the process
+            // exits, and the OS will clean up sockets / file descriptors.
+            // If the supervisor thread is still joinable, wait a short grace
+            // period before exiting.
+            if (supervisor_thread.joinable()) {
+                // Give the supervisor a brief window to notice the signal.
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
+
+        if (supervisor_thread.joinable()) {
+            supervisor_thread.join();
+        }
+        return supervisor_ret.load(std::memory_order_acquire);
     } else {
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
@@ -1125,6 +1187,30 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceAvailable(true);
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
-        return server.start();
+
+        // Start the server on a dedicated thread so the main thread can
+        // intercept SIGINT / SIGTERM and call server.stop() gracefully.
+        std::thread server_thread([&]() {
+            auto ec = server.start();
+            if (ec) {
+                LOG(INFO) << "Server stopped normally: " << ec.message();
+            }
+        });
+
+        // Wait until a shutdown signal is received.
+        while (!g_shutdown_requested.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        LOG(INFO) << "Master received shutdown signal, stopping server...";
+        server.stop();
+        admin_server.Stop();
+
+        if (server_thread.joinable()) {
+            server_thread.join();
+        }
+
+        LOG(INFO) << "Master shutdown complete.";
+        return 0;
     }
 }
